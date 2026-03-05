@@ -173,6 +173,8 @@ def log_diagnostics(
     print(f"  鮮度フィルタ通過数: {freshness_stats.passed}")
     print(f"  古い記事除外数: {freshness_stats.excluded_stale}")
     print(f"  日付不明(JP)除外数: {freshness_stats.excluded_no_date_jp}")
+    if freshness_stats.jp_fallback_used:
+        print(f"  JP fallback発動: {freshness_stats.jp_fallback_added}件救済")
     print(f"  重複除外数: {diff_info['repeatedCount']}")
     print(f"  Tavily取得数: {snapshot_diag.get('tavilyHits', 0)}")
     print(f"  RSS取得数: {snapshot_diag.get('rssHits', 0)}")
