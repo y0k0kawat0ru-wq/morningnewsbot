@@ -1,68 +1,62 @@
 from __future__ import annotations
 
+import re
+import unicodedata
 from hashlib import sha256
 from typing import Any
 
-
-def _stable_digest(*parts: str) -> str:
-    return sha256("||".join(parts).encode("utf-8")).hexdigest()
+from snapshot_collector import NewsItem
 
 
-def collect_all_content_items(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
+def normalize_title(title: str) -> str:
+    """Normalize a title for dedup comparison.
 
-    for label, payload in snapshot.get("indices", {}).items():
-        date = str(payload.get("date", ""))
-        key = f"econ|{date}|global|{label}"
-        items.append(
-            {
-                "key": key,
-                "kind": "econ",
-                "label": f"{label} {payload.get('close', 'n/a')} ({date})",
-                "raw": payload,
-            }
-        )
-
-    for bucket, bucket_items in snapshot.get("news", {}).items():
-        prefix = "rss" if bucket == "rssFallback" else "news"
-        for item in bucket_items:
-            title = str(item.get("title", "")).strip()
-            url = str(item.get("url", "")).strip()
-            digest = _stable_digest(url, title)
-            items.append(
-                {
-                    "key": f"{prefix}|{digest}",
-                    "kind": prefix,
-                    "label": title or url or "(untitled)",
-                    "bucket": bucket,
-                    "raw": item,
-                }
-            )
-
-    return items
+    - NFKC normalization (full-width → half-width)
+    - Strip leading/trailing whitespace
+    - Collapse consecutive whitespace
+    - Remove trailing source name noise (e.g. " - 日経新聞", " | Reuters")
+    - Lowercase
+    """
+    if not title:
+        return ""
+    t = unicodedata.normalize("NFKC", title)
+    t = t.strip()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"\s*[\-|–—]\s*[^\-|–—]{2,30}$", "", t)
+    return t.lower()
 
 
-def compute_diff_from_previous(snapshot: dict[str, Any], prev_state: dict[str, Any]) -> dict[str, Any]:
-    current_items = collect_all_content_items(snapshot)
-    current_keys = [item["key"] for item in current_items]
+def make_dedupe_key(item: NewsItem) -> str:
+    """Generate a stable dedup key for a news item.
+
+    Priority: canonical_url > source + normalized_title.
+    """
+    if item.canonical_url:
+        base = item.canonical_url
+    else:
+        base = f"{item.source}|{normalize_title(item.title)}"
+    return sha256(base.encode("utf-8")).hexdigest()
+
+
+def compute_diff_from_previous(
+    news_items: list[NewsItem],
+    prev_state: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare current news items against previous state to find new items."""
+    current_keys: list[str] = []
+    new_items: list[NewsItem] = []
     prev_keys = set(prev_state.get("last_keys", []))
 
-    new_items = [item for item in current_items if item["key"] not in prev_keys]
-    repeated_count = max(0, len(current_items) - len(new_items))
-    fallback_items = new_items if new_items else current_items[:4]
+    for item in news_items:
+        key = make_dedupe_key(item)
+        current_keys.append(key)
+        if key not in prev_keys:
+            new_items.append(item)
+
+    repeated_count = max(0, len(news_items) - len(new_items))
 
     return {
         "currentKeys": current_keys,
         "newItems": new_items,
         "repeatedCount": repeated_count,
-        "fallbackItems": fallback_items,
     }
-
-
-def append_dedup_note_if_needed(summary: str, diff_info: dict[str, Any]) -> str:
-    if diff_info.get("newItems"):
-        return summary
-    note = "※ 新規性は限定的（前回配信時と同一の材料が中心）"
-    if note in summary:
-        return summary
-    return f"{summary.rstrip()}\n\n{note}"
