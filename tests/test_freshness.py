@@ -45,10 +45,26 @@ class TestFreshnessFilter:
         fresh, stats = filter_fresh_news([item], now)
         assert len(fresh) == 1
 
-    def test_jp_no_date_excluded(self):
-        """JP news without published date should be excluded."""
+    def test_jp_no_date_recent_retrieval_passes(self):
+        """JP news without published_at but recently retrieved should pass."""
         now = datetime.now(JST)
         item = _make_item(category="jp_market", published_at=None)
+        # _make_item sets retrieved_at_jst=now, so it's within 24h
+        fresh, stats = filter_fresh_news([item], now)
+        assert len(fresh) == 1
+
+    def test_no_date_old_retrieval_excluded(self):
+        """News without published_at and old retrieved_at should be excluded."""
+        now = datetime.now(JST)
+        item = NewsItem(
+            title="Old Retrieved",
+            url="https://example.com/old",
+            canonical_url="https://example.com/old",
+            source="example.com",
+            published_at_jst=None,
+            retrieved_at_jst=now - timedelta(hours=25),
+            category="jp_market",
+        )
         fresh, stats = filter_fresh_news([item], now)
         assert len(fresh) == 0
         assert stats.excluded_no_date_jp == 1
@@ -79,21 +95,26 @@ class TestFreshnessFilter:
         items = [
             _make_item(category="us_macro", published_at=now - timedelta(hours=2)),   # pass
             _make_item(category="us_macro", published_at=now - timedelta(hours=30)),  # stale
-            _make_item(category="jp_market", published_at=None),                      # no date JP
+            _make_item(category="jp_market", published_at=None),                      # pass (retrieved recently)
             _make_item(category="jp_market", published_at=now - timedelta(hours=1)),  # pass
         ]
         fresh, stats = filter_fresh_news(items, now)
-        assert len(fresh) == 2
+        assert len(fresh) == 3
         assert stats.excluded_stale == 1
-        assert stats.excluded_no_date_jp == 1
         assert stats.total_input == 4
 
     def test_stats_excluded_items_recorded(self):
         now = datetime.now(JST)
-        item = _make_item(category="jp_market", published_at=None)
-        item.title = "Important News"
-        item.source = "nikkei.com"
+        item = NewsItem(
+            title="Important News",
+            url="https://example.com/article",
+            canonical_url="https://example.com/article",
+            source="nikkei.com",
+            published_at_jst=None,
+            retrieved_at_jst=now - timedelta(hours=25),
+            category="jp_market",
+        )
         _, stats = filter_fresh_news([item], now)
         assert len(stats.excluded_items) == 1
-        assert stats.excluded_items[0]["reason"] == "no_date_jp"
+        assert stats.excluded_items[0]["reason"] == "no_date_stale_retrieval"
         assert stats.excluded_items[0]["source"] == "nikkei.com"

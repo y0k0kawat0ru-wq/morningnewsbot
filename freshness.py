@@ -24,28 +24,14 @@ def filter_fresh_news(
     """Filter news items by freshness.
 
     Rules:
-    - JP news: published_at_jst is required; exclude if None
-    - JP news: exclude if older than max_age_hours
-    - Global news: exclude if published_at_jst exists and older than max_age_hours
-    - Global news: keep if published_at_jst is None (cannot determine freshness)
+    - If published_at_jst exists and older than max_age_hours → exclude
+    - If published_at_jst is None → fall back to retrieved_at_jst for freshness check
     """
     stats = FreshnessStats(total_input=len(items))
     fresh: list[NewsItem] = []
     cutoff = now_jst - timedelta(hours=max_age_hours)
 
     for item in items:
-        is_jp = item.category.startswith("jp_")
-
-        # JP news with no published date → exclude
-        if is_jp and item.published_at_jst is None:
-            stats.excluded_no_date_jp += 1
-            stats.excluded_items.append({
-                "title": item.title,
-                "source": item.source,
-                "reason": "no_date_jp",
-            })
-            continue
-
         # Has published date and it's too old → exclude
         if item.published_at_jst is not None and item.published_at_jst < cutoff:
             stats.excluded_stale += 1
@@ -54,6 +40,16 @@ def filter_fresh_news(
                 "source": item.source,
                 "reason": "stale",
                 "published_at": item.published_at_jst.isoformat(),
+            })
+            continue
+
+        # No published date → use retrieved_at as fallback
+        if item.published_at_jst is None and item.retrieved_at_jst < cutoff:
+            stats.excluded_no_date_jp += 1
+            stats.excluded_items.append({
+                "title": item.title,
+                "source": item.source,
+                "reason": "no_date_stale_retrieval",
             })
             continue
 
