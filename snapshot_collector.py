@@ -95,6 +95,20 @@ RSS_FEEDS = [
     "https://news.google.com/rss/search?q=global+markets&hl=en-US&gl=US&ceid=US:en",
 ]
 INDEX_LABELS = ("S&P500", "Nasdaq100", "Dow", "VIX", "USDJPY")
+YAHOO_CHART_HOSTS = (
+    "https://query2.finance.yahoo.com",
+    "https://query1.finance.yahoo.com",
+)
+YAHOO_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/135.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+YAHOO_RETRY_DELAY_SECONDS = 1.5
 
 
 @dataclass(slots=True)
@@ -222,23 +236,38 @@ async def _fetch_yahoo_chart_data(
     last_error: str | None = None
     for symbol in symbol_candidates:
         encoded_symbol = quote(symbol, safe="")
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
-        params = {
-            "range": "5d",
-            "interval": "1d",
-            "includePrePost": "false",
-            "events": "div,splits",
-        }
-        try:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            data, error = _parse_yahoo_chart_payload(label, symbol, response.json())
-            if data is not None:
-                return label, data, None
-            last_error = error
-        except Exception as exc:  # noqa: BLE001
-            last_error = f"{symbol}: {exc}"
+        for host in YAHOO_CHART_HOSTS:
+            url = f"{host}/v8/finance/chart/{encoded_symbol}"
+            params = {
+                "range": "5d",
+                "interval": "1d",
+                "includePrePost": "false",
+                "events": "div,splits",
+            }
+            try:
+                response = await client.get(url, params=params, headers=YAHOO_REQUEST_HEADERS)
+                if response.status_code == 429:
+                    last_error = f"{symbol}: HTTP 429 from {urlparse(host).netloc}"
+                    await asyncio.sleep(YAHOO_RETRY_DELAY_SECONDS)
+                    continue
+                response.raise_for_status()
+                data, error = _parse_yahoo_chart_payload(label, symbol, response.json())
+                if data is not None:
+                    return label, data, None
+                last_error = error
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{symbol}: {exc}"
     return label, None, last_error
+
+
+async def _collect_index_results(
+    client: httpx.AsyncClient,
+) -> list[tuple[str, IndexData | None, str | None]]:
+    """Fetch index data sequentially to avoid Yahoo rate limits in Actions."""
+    results: list[tuple[str, IndexData | None, str | None]] = []
+    for label in INDEX_LABELS:
+        results.append(await _fetch_index_data(client=client, label=label))
+    return results
 
 
 async def _fetch_index_data(
@@ -438,17 +467,13 @@ async def collect_morning_snapshot() -> dict[str, Any]:
     all_news: list[NewsItem] = []
 
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        index_tasks = [
-            _fetch_index_data(client=client, label=label)
-            for label in INDEX_LABELS
-        ]
         tavily_tasks = [
             _search_tavily(client=client, query=q, now=now)
             for q in tavily_queries
         ]
 
         index_results, tavily_results = await asyncio.gather(
-            asyncio.gather(*index_tasks),
+            _collect_index_results(client),
             asyncio.gather(*tavily_tasks),
         )
 
