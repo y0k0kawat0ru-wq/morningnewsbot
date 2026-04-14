@@ -51,5 +51,9 @@ jobs:
             echo "No state changes to commit"
           else
             git commit -m "Update state [skip ci]"
-            git push
+            if git push; then
+              echo "State changes pushed"
+            else
+              echo "::warning::State changes could not be pushed, likely because main is protected. Continuing without failing workflow."
+            fi
           fi

@@ -10,7 +10,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 import feedparser
 import httpx
@@ -68,6 +68,13 @@ STOOQ_SYMBOLS: dict[str, list[str]] = {
     "VIX": ["^vix", "vix"],
     "USDJPY": ["usdjpy"],
 }
+YAHOO_SYMBOLS: dict[str, list[str]] = {
+    "S&P500": ["^GSPC"],
+    "Nasdaq100": ["^NDX"],
+    "Dow": ["^DJI"],
+    "VIX": ["^VIX"],
+    "USDJPY": ["USDJPY=X", "JPY=X"],
+}
 
 TAVILY_DOMAINS_GLOBAL = [
     "reuters.com",
@@ -87,6 +94,7 @@ RSS_FEEDS = [
     "https://news.google.com/rss/search?q=%E6%97%A5%E6%9C%AC%E6%A0%AA+%E5%B8%82%E5%A0%B4&hl=ja&gl=JP&ceid=JP:ja",
     "https://news.google.com/rss/search?q=global+markets&hl=en-US&gl=US&ceid=US:en",
 ]
+INDEX_LABELS = ("S&P500", "Nasdaq100", "Dow", "VIX", "USDJPY")
 
 
 @dataclass(slots=True)
@@ -138,6 +146,125 @@ def _struct_time_to_jst(st: Any) -> datetime | None:
         return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(JST)
     except Exception:
         return None
+
+
+def _date_from_unix_timestamp(ts: Any) -> str | None:
+    """Convert a Unix timestamp to an ISO date string."""
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
+    except Exception:
+        return None
+
+
+def _parse_yahoo_chart_payload(
+    label: str,
+    symbol: str,
+    payload: dict[str, Any],
+) -> tuple[IndexData | None, str | None]:
+    """Parse Yahoo Finance chart payload into IndexData."""
+    chart = payload.get("chart") or {}
+    result = chart.get("result") or []
+    if not result:
+        error = chart.get("error")
+        if isinstance(error, dict) and error.get("description"):
+            return None, str(error["description"])
+        return None, f"no result for {symbol}"
+
+    series = result[0] or {}
+    indicators = series.get("indicators") or {}
+    quotes = indicators.get("quote") or []
+    if not quotes:
+        return None, f"no quotes for {symbol}"
+
+    timestamps = series.get("timestamp") or []
+    closes = quotes[0].get("close") or []
+    valid_points: list[tuple[str, float]] = []
+    for ts, close in zip(timestamps, closes):
+        if close is None:
+            continue
+        try:
+            close_val = float(close)
+        except (TypeError, ValueError):
+            continue
+        date_val = _date_from_unix_timestamp(ts)
+        if date_val is None:
+            continue
+        valid_points.append((date_val, close_val))
+
+    if not valid_points:
+        return None, f"no rows for {symbol}"
+
+    current_date, current_close = valid_points[-1]
+    prev_date: str | None = None
+    prev_close: float | None = None
+    if len(valid_points) >= 2:
+        prev_date, prev_close = valid_points[-2]
+
+    return (
+        IndexData(
+            symbol=symbol,
+            label=label,
+            date=current_date,
+            close=current_close,
+            prev_date=prev_date,
+            prev_close=prev_close,
+        ),
+        None,
+    )
+
+
+async def _fetch_yahoo_chart_data(
+    client: httpx.AsyncClient,
+    label: str,
+    symbol_candidates: list[str],
+) -> tuple[str, IndexData | None, str | None]:
+    """Fetch index data from Yahoo Finance chart API."""
+    last_error: str | None = None
+    for symbol in symbol_candidates:
+        encoded_symbol = quote(symbol, safe="")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
+        params = {
+            "range": "5d",
+            "interval": "1d",
+            "includePrePost": "false",
+            "events": "div,splits",
+        }
+        try:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data, error = _parse_yahoo_chart_payload(label, symbol, response.json())
+            if data is not None:
+                return label, data, None
+            last_error = error
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"{symbol}: {exc}"
+    return label, None, last_error
+
+
+async def _fetch_index_data(
+    client: httpx.AsyncClient,
+    label: str,
+) -> tuple[str, IndexData | None, str | None]:
+    """Fetch index data with Yahoo primary and Stooq fallback."""
+    errors: list[str] = []
+
+    yahoo_candidates = YAHOO_SYMBOLS.get(label, [])
+    if yahoo_candidates:
+        _, data, error = await _fetch_yahoo_chart_data(client, label, yahoo_candidates)
+        if data is not None:
+            return label, data, None
+        if error:
+            errors.append(f"yahoo {error}")
+
+    stooq_candidates = STOOQ_SYMBOLS.get(label, [])
+    if stooq_candidates:
+        _, data, error = await _fetch_stooq_data(client, label, stooq_candidates)
+        if data is not None:
+            return label, data, None
+        if error:
+            errors.append(f"stooq {error}")
+
+    return label, None, " | ".join(errors) if errors else "no data sources configured"
 
 
 async def _fetch_stooq_data(
@@ -311,25 +438,25 @@ async def collect_morning_snapshot() -> dict[str, Any]:
     all_news: list[NewsItem] = []
 
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        stooq_tasks = [
-            _fetch_stooq_data(client=client, label=label, symbol_candidates=candidates)
-            for label, candidates in STOOQ_SYMBOLS.items()
+        index_tasks = [
+            _fetch_index_data(client=client, label=label)
+            for label in INDEX_LABELS
         ]
         tavily_tasks = [
             _search_tavily(client=client, query=q, now=now)
             for q in tavily_queries
         ]
 
-        stooq_results, tavily_results = await asyncio.gather(
-            asyncio.gather(*stooq_tasks),
+        index_results, tavily_results = await asyncio.gather(
+            asyncio.gather(*index_tasks),
             asyncio.gather(*tavily_tasks),
         )
 
-    for label, data, error in stooq_results:
+    for label, data, error in index_results:
         if data:
             indices[label] = data
         elif error:
-            diagnostics["errors"].append(f"stooq[{label}] {error}")
+            diagnostics["errors"].append(f"indices[{label}] {error}")
 
     for category, items, error in tavily_results:
         deduped = _dedupe_news_items(items)
